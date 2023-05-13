@@ -1,0 +1,97 @@
+
+mlir::iree_compiler::TileToScfForAndFuseResult
+mlir::iree_compiler::buildTileFuseToScfFor(ImplicitLocOpBuilder &b,
+                                           Value isolatedParentOpH, Value rootH,
+                                           ValueRange opsHToFuse,
+                                           ArrayRef<OpFoldResult> tileSizes) {
+  assert(opsHToFuse.empty() && "No fusion supported yet");
+  iree_compiler::TileToScfForAndFuseResult result;
+  auto tiletoScfForOp = b.create<transform::TileOp>(rootH, tileSizes);
+  result.forLoops = tiletoScfForOp.getLoops();
+  result.tiledOpH = tiletoScfForOp.getTiledLinalgOp();
+
+  // Perform a pass of canonicalization + enabling after tiling.
+  ApplyPatternsOpPatterns configuration;
+  isolatedParentOpH =
+      mlir::iree_compiler::buildCanonicalizationAndEnablingTransforms(
+          b, configuration, isolatedParentOpH);
+  return result;
+}
+
+template <typename TilingTransformOp, typename TileOrNumThreadSpec>
+static iree_compiler::TileToForallAndFuseAndDistributeResult
+buildTileAndFuseAndDistributeImpl(ImplicitLocOpBuilder &b,
+                                  Value isolatedParentOpH, Value rootH,
+                                  ValueRange opsHToFuse,
+                                  ArrayRef<OpFoldResult> tileSizesOrNumThreads,
+                                  ArrayAttr threadDimMapping, bool isTrail) {
+  iree_compiler::TileToForallAndFuseAndDistributeResult result;
+  auto tileToForeachOp = b.create<TilingTransformOp>(
+      rootH, tileSizesOrNumThreads, TileOrNumThreadSpec(), threadDimMapping);
+  result.forallH = tileToForeachOp.getForallOp();
+  result.tiledOpH = tileToForeachOp.getTiledOp();
+
+  // Perform a pass of canonicalization + enabling after tiling.
+  ApplyPatternsOpPatterns configuration;
+  isolatedParentOpH =
+      mlir::iree_compiler::buildCanonicalizationAndEnablingTransforms(
+          b, configuration, isolatedParentOpH);
+
+  // Batch fusion if requested.
+  llvm::dbgs()<< " is trailing heh? "<<isTrail <<" opsHToFuse.size: "<<opsHToFuse.size() << "\n";
+  if (opsHToFuse.size() > 1) {
+    Value mergedOpsH =
+        b.create<MergeHandlesOp>(opsHToFuse, /*deduplicate=*/true);
+    b.create<FuseIntoContainingOp>(mergedOpsH, result.forallH);
+  } else if (opsHToFuse.size() == 1) {
+    Value fusedH =
+        b.create<FuseIntoContainingOp>(opsHToFuse.front(), result.forallH);
+    result.resultingFusedOpsHandles.push_back(fusedH);
+  }
+  return result;
+}
+
+std::array<int64_t, 3> getWorkgroupSize(mlir::func::FuncOp funcOp) {
+  std::array<int64_t, 3> workgroupSize;
+  FailureOr<IREE::HAL::ExecutableExportOp> exportOp =
+      mlir::iree_compiler::getEntryPoint(funcOp);
+  std::optional<mlir::ArrayAttr> workgroupSizeAttr =
+      exportOp->getWorkgroupSize();
+  assert(workgroupSizeAttr.has_value());
+  for (auto [index, attr] : llvm::enumerate(workgroupSizeAttr.value())) {
+    workgroupSize[index] =
+        attr.cast<mlir::IntegerAttr>().getValue().getZExtValue();
+  }
+  return workgroupSize;
+}
+
+llvm::enumerate
+
+
+      %3 = tensor.empty() : tensor<128x10xf32>
+
+      %4 = tensor.empty() : tensor<128xf32>
+
+      %5 = linalg.fill ins(%cst : f32) outs(%4 : tensor<128xf32>) -> tensor<128xf32>
+
+      %6 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>], iterator_types = ["parallel", "reduction"]} ins(%2 : tensor<128x10xf32>) outs(%5 : tensor<128xf32>) {
+
+      ^bb0(%in: f32, %out: f32):
+
+        %8 = arith.maxf %out, %in : f32
+
+        linalg.yield %8 : f32
+
+      } -> tensor<128xf32>
+
+      %7 = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%2, %6 : tensor<128x10xf32>, tensor<128xf32>) outs(%3 : tensor<128x10xf32>) {
+
+      ^bb0(%in: f32, %in_0: f32, %out: f32):
+
+        %8 = arith.subf %in, %in_0 : f32
+
+        %9 = math.exp %8 : f32
+
+        linalg.yield %9 : f32
+
+      } -> tensor<128x10xf32>
